@@ -1,10 +1,15 @@
-"""Build the print-ready UIA roll-up banner PDF.
+"""Build the UIA roll-up banner PDF.
 
-All type is converted to vector outlines (no live fonts in the PDF) and the
-logo is traced to vectors, so the file opens and prints identically in any
-viewer, RIP or device. Run:  python3 build_banner.py
+    python3 build_banner.py             -> print version: all type converted to
+                                           vector outlines, no fonts in the PDF
+    python3 build_banner.py --editable  -> design version: live, editable text
+                                           with the fonts embedded
+
+The logo is traced to vectors in both, and every element is a separate object.
 """
 import os
+import re
+import sys
 
 import numpy as np
 import potrace
@@ -16,12 +21,16 @@ from fontTools.ttLib.removeOverlaps import removeOverlaps
 from PIL import Image, ImageFilter
 from reportlab.lib.colors import CMYKColor
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont as RLTTFont
 from reportlab.pdfgen import canvas
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONTS = os.path.join(HERE, "assets", "fonts")
 LOGO_SRC = os.path.join(HERE, "assets", "source.webp")
-OUT = os.path.join(HERE, "UIA-Banner-85x200cm-print.pdf")
+EDITABLE = "--editable" in sys.argv
+OUT = os.path.join(HERE, "UIA-Banner-85x200cm-%s.pdf"
+                   % ("editable" if EDITABLE else "print"))
 
 # Artwork is laid out in millimetres, origin top-left (the reference image is
 # 830x2000 px, so 1 px ~ 1 mm; X is shifted 10 mm to fill the 850 mm width).
@@ -39,7 +48,8 @@ LABEL = CMYKColor(0.12, 0.08, 0.06, 0.0)
 c = canvas.Canvas(OUT, pagesize=((W + 2 * BLEED) * mm, (H + 2 * BLEED) * mm))
 c.setTitle("United International Academy - Floor 4 Banner (85x200 cm)")
 c.setAuthor("United International Academy")
-c.setSubject("Print-ready banner, text converted to outlines, CMYK")
+c.setSubject("Editable banner design, live text, CMYK" if EDITABLE else
+             "Print-ready banner, text converted to outlines, CMYK")
 c.setPageCompression(1)
 
 
@@ -76,12 +86,16 @@ class Font:
         self.cap = self.tt["OS/2"].sCapHeight
         self.order = self.tt.getGlyphOrder()
         self.hbfont = hb.Font(hb.Face(hb.Blob.from_file_path(path)))
+        self.name = os.path.splitext(name)[0]
+        if EDITABLE:
+            pdfmetrics.registerFont(RLTTFont(self.name, path))
 
     def shape(self, text):
         buf = hb.Buffer()
         buf.add_str(text)
         buf.guess_segment_properties()
-        hb.shape(self.hbfont, buf, {"kern": True, "liga": True})
+        # Live text is placed by advance widths only, so match that when editable.
+        hb.shape(self.hbfont, buf, {"kern": not EDITABLE, "liga": not EDITABLE})
         return [(self.order[i.codepoint], p.x_advance, p.x_offset, p.y_offset)
                 for i, p in zip(buf.glyph_infos, buf.glyph_positions)]
 
@@ -102,7 +116,7 @@ class Font:
 
 def text(font, s, *, baseline, color, x=None, cx=None, width=None,
          cap=None, size=None, track=0.0):
-    """Draw `s` as outlines.
+    """Draw `s` as outlines, or as live text in the editable build.
 
     Size comes from `cap` (cap height in mm) or `size` (em in mm) or `width`.
     With cap/size + width, letter tracking is solved to hit the ink width.
@@ -122,12 +136,17 @@ def text(font, s, *, baseline, color, x=None, cx=None, width=None,
     left = (cx - ink_w / 2) if cx is not None else x
     ox = left - l * k
 
+    c.setFillColor(color)
+    if EDITABLE:
+        c.setFont(font.name, size * mm)
+        c.drawString(*P(ox, baseline), s, charSpace=track * k * mm)
+        return
+
     path = c.beginPath()
     for g, gx, gy in glyphs:
         def tf(p, gx=gx, gy=gy):
             return P(ox + (gx + p[0]) * k, baseline - (gy + p[1]) * k)
         font.gs[g].draw(RLPen(font.gs, path, tf))
-    c.setFillColor(color)
     c.drawPath(path, stroke=0, fill=1, fillMode=0)  # nonzero winding
 
 
@@ -246,16 +265,21 @@ c.setBleedBox((0, 0, (W + 2 * BLEED) * mm, (H + 2 * BLEED) * mm))
 c.showPage()
 c.save()
 
-# ReportLab always registers Helvetica even when unused; drop it so the PDF
-# contains zero font resources (every letter is a vector outline).
+# ReportLab always registers Helvetica (as /F1) even when unused; drop it.
+# In the print build that leaves zero font resources (all type is outlines).
 import pymupdf  # noqa: E402
 
 doc = pymupdf.open(OUT)
 page = doc[0]
-res = doc.xref_get_key(page.xref, "Resources")
-if res[0] == "xref":
-    res_xref = int(res[1].split()[0])
-    doc.xref_set_key(res_xref, "Font", "null")
+kind, val = doc.xref_get_key(page.xref, "Resources/Font")
+if EDITABLE:
+    fonts_xref = int(val.split()[0]) if kind == "xref" else None
+    fonts = doc.xref_object(fonts_xref) if fonts_xref else val
+    fonts = re.sub(r"/F1\s+\d+\s+0\s+R", "", fonts)
+    if fonts_xref:
+        doc.update_object(fonts_xref, fonts)
+    else:
+        doc.xref_set_key(page.xref, "Resources/Font", fonts)
 else:
     doc.xref_set_key(page.xref, "Resources/Font", "null")
 doc.save(OUT + ".tmp", garbage=4, deflate=True)
